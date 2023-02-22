@@ -1,0 +1,24 @@
+[package]
+name = "mergers3"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.64"
+aws-config = "0.54.1"
+aws-credential-types = { version = "0.54.1", features = ["hardcoded-credentials"] }
+aws-sdk-s3 = "0.24.0"
+aws-smithy-http = "0.54.3"
+chrono = "0.4.23"
+env_logger = "0.10.0"
+futures = "0.3.26"
+hyper = { version = "0.14.24", features = ["full"] }
+log = "0.4.17"
+s3s = "0.3.2"
+s3s-aws = "0.3.2"
+serde = "1.0.152"
+serde_yaml = "0.9.17"
+time = "0.3.19"
+tokio = { version = "1.25.0", features = ["full"] }
