@@ -1,20 +1,17 @@
 use std::{collections::BTreeMap, fs::File};
 
 use aws_sdk_s3::{
-    error::{DeleteObjectError, GetObjectError, ListObjectsError},
-    input::{DeleteObjectInput, GetObjectInput, ListObjectsInput},
-    output::GetObjectOutput,
-    presigning::config::PresigningConfig,
+    error::{DeleteObjectError, GetObjectError, HeadObjectError, ListObjectsError},
+    input::{DeleteObjectInput, GetObjectInput, HeadObjectInput, ListObjectsInput},
     types::{ByteStream, SdkError},
     Client, Credentials, Region,
 };
-use aws_smithy_http::operation::error::BuildError;
-use hyper::Response;
-use log::debug;
+use log::{debug, warn};
 use serde::{
     de::{MapAccess, Visitor},
     Deserialize, Deserializer,
 };
+use tokio::io::AsyncReadExt;
 
 pub struct DeserializableBucket {
     client: Client,
@@ -120,21 +117,31 @@ impl std::fmt::Debug for DeserializableBucket {
 }
 
 impl DeserializableBucket {
-    pub async fn create_capacity_file(&self) {
-        if self
+    async fn get_cached_used_bytes(&self) -> Option<i64> {
+        match self
             .client
-            .head_object()
+            .get_object()
             .bucket(&self.bucket_name)
             .key(".mergers3")
             .send()
             .await
-            .is_ok()
         {
-            // .mergers3 file already exists, skip
-            return;
+            Ok(output) => {
+                let mut bytes = vec![];
+                output
+                    .body
+                    .into_async_read()
+                    .read_to_end(&mut bytes)
+                    .await
+                    .unwrap();
+                let used_bytes = String::from_utf8(bytes).unwrap().parse::<i64>().unwrap();
+                Some(used_bytes)
+            }
+            Err(_) => None,
         }
+    }
 
-        // calculate the used capacity of bucket
+    async fn calc_used_bytes(&self) -> i64 {
         let mut used_bytes = 0;
         let mut continuation_token: Option<String> = None;
         loop {
@@ -142,19 +149,26 @@ impl DeserializableBucket {
                 .client
                 .list_objects_v2()
                 .bucket(&self.bucket_name)
-                .continuation_token(continuation_token.unwrap_or_default())
+                .set_continuation_token(continuation_token)
                 .send()
                 .await
                 .expect("Failed to list objects in bucket");
-            for object in list_objects_output.contents.unwrap() {
+
+            for object in list_objects_output.contents.as_ref().unwrap_or(&vec![]) {
                 used_bytes += object.size;
             }
-            if list_objects_output.next_continuation_token.is_none() {
+
+            let next_continuation_token = list_objects_output.next_continuation_token();
+            if next_continuation_token.is_none() {
                 break;
             }
             continuation_token = list_objects_output.next_continuation_token;
         }
 
+        used_bytes
+    }
+
+    async fn put_capacity_file(&self, used_bytes: i64) {
         // write the used capacity to the .mergers3 file
         // this might change the capacity of the bucket, but it should only be a few bytes
         self.client
@@ -171,6 +185,24 @@ impl DeserializableBucket {
                 )
                 .as_str(),
             );
+    }
+
+    async fn put_capacity_file_if_missing(&self) {
+        if self.get_cached_used_bytes().await.is_none() {
+            self.put_capacity_file(self.calc_used_bytes().await).await;
+        }
+    }
+
+    async fn check_capacity_file(&self) {
+        let cached_used_bytes = self.get_cached_used_bytes().await;
+        if cached_used_bytes.is_some() {
+            let used_bytes = self.calc_used_bytes().await;
+            if used_bytes != cached_used_bytes.unwrap() {
+                warn!("Bucket {} has a .mergers3 file with a different capacity ({}) than the actual capacity ({})", self.bucket_name, cached_used_bytes.unwrap(), used_bytes);
+            }
+        } else {
+            warn!("Bucket {} does not have a .mergers3 file", self.bucket_name);
+        }
     }
 }
 
@@ -191,7 +223,56 @@ pub struct SourceBucket {
     capacity_bytes: u64,
 }
 
+pub enum SourceBucketDeleteObjectError {
+    DeleteObject(SdkError<DeleteObjectError>),
+    HeadObject(SdkError<HeadObjectError>),
+}
+
+impl From<SdkError<DeleteObjectError>> for SourceBucketDeleteObjectError {
+    fn from(e: SdkError<DeleteObjectError>) -> Self {
+        SourceBucketDeleteObjectError::DeleteObject(e)
+    }
+}
+
+impl From<SdkError<HeadObjectError>> for SourceBucketDeleteObjectError {
+    fn from(e: SdkError<HeadObjectError>) -> Self {
+        SourceBucketDeleteObjectError::HeadObject(e)
+    }
+}
+
 impl SourceBucket {
+    pub async fn update_used_bytes(&self, delta_bytes: i64) {
+        let used_bytes = match self.bucket.get_cached_used_bytes().await {
+            Some(used_bytes) => used_bytes,
+            None => self.bucket.calc_used_bytes().await,
+        };
+
+        self.bucket
+            .put_capacity_file(used_bytes + delta_bytes)
+            .await;
+    }
+
+    pub async fn head_object(
+        &self,
+        input: &HeadObjectInput,
+    ) -> Result<aws_sdk_s3::output::HeadObjectOutput, SdkError<HeadObjectError>> {
+        let mut input = input.clone();
+        input.bucket = Some(self.bucket.bucket_name.clone());
+        let operation = input.make_operation(self.bucket.client.conf()).await;
+
+        self.bucket
+            .client
+            .head_object()
+            .key(" ") // required so that the operation builds successfully
+            .customize()
+            .await
+            .unwrap()
+            .map_operation(|_| operation)
+            .unwrap()
+            .send()
+            .await
+    }
+
     pub async fn get_object(
         &self,
         input: &GetObjectInput,
@@ -213,24 +294,39 @@ impl SourceBucket {
             .await
     }
 
-    pub async fn delete_object(
+    pub async fn delete_object_and_update_size(
         &self,
         input: &DeleteObjectInput,
-    ) -> Result<aws_sdk_s3::output::DeleteObjectOutput, SdkError<DeleteObjectError>> {
+    ) -> Result<aws_sdk_s3::output::DeleteObjectOutput, SourceBucketDeleteObjectError> {
+        let obj_size = self
+            .bucket
+            .client
+            .head_object()
+            .bucket(&self.bucket.bucket_name)
+            .key(input.key.as_ref().unwrap())
+            .send()
+            .await?
+            .content_length;
+
         let mut input = input.clone();
         input.bucket = Some(self.bucket.bucket_name.clone());
         let operation = input.make_operation(self.bucket.client.conf()).await;
 
-        self.bucket
+        let resp = self
+            .bucket
             .client
             .delete_object()
+            .key(" ")
             .customize()
             .await
             .unwrap()
             .map_operation(|_| operation)
             .unwrap()
             .send()
-            .await
+            .await?;
+
+        self.update_used_bytes(-obj_size).await;
+        Ok(resp)
     }
 
     pub async fn list_objects(
@@ -262,7 +358,15 @@ impl MergedBucket {
         let futures = self
             .0
             .iter()
-            .map(|source_bucket| source_bucket.bucket.create_capacity_file());
+            .map(|source_bucket| source_bucket.bucket.put_capacity_file_if_missing());
+        futures::future::join_all(futures).await;
+    }
+
+    async fn check_capacity_files(&self) {
+        let futures = self
+            .0
+            .iter()
+            .map(|source_bucket| source_bucket.bucket.check_capacity_file());
         futures::future::join_all(futures).await;
     }
 
@@ -283,7 +387,11 @@ pub async fn read_config() -> BTreeMap<String, MergedBucket> {
         .values()
         .map(|bucket| bucket.create_capacity_files());
     futures::future::join_all(futures).await;
-
     debug!(".mergers3 capacity files created.");
+
+    println!("Checking for incorrect capacity files...");
+    let futures = buckets.values().map(|bucket| bucket.check_capacity_files());
+    futures::future::join_all(futures).await;
+
     buckets
 }

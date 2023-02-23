@@ -6,8 +6,8 @@ use log::debug;
 use s3s::{
     dto::{
         Bucket, CommonPrefixList, DeleteObjectInput, DeleteObjectOutput, GetObjectInput,
-        GetObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
-        NextMarker, ObjectList, Timestamp,
+        GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+        ListObjectsInput, ListObjectsOutput, NextMarker, ObjectList, Timestamp,
     },
     service::S3Service,
     S3Error, S3Result, S3,
@@ -55,6 +55,26 @@ impl S3 for MergerS3 {
         })
     }
 
+    async fn head_object(&self, input: HeadObjectInput) -> S3Result<HeadObjectOutput> {
+        let bucket = self.buckets.get(&input.bucket);
+        if bucket.is_none() {
+            return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
+        }
+        let bucket = bucket.unwrap();
+
+        let aws_input = try_into_aws(input).expect("Failed to convert GetObjectInput to AWS");
+
+        let futures = bucket
+            .as_content()
+            .into_iter()
+            .map(|source_bucket| source_bucket.head_object(&aws_input));
+
+        match utils::select_ok(futures).await {
+            Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
+            Err(_) => Err(S3Error::new(s3s::S3ErrorCode::NoSuchKey)),
+        }
+    }
+
     async fn get_object(&self, input: GetObjectInput) -> S3Result<GetObjectOutput> {
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
@@ -87,16 +107,22 @@ impl S3 for MergerS3 {
         let futures = bucket
             .as_content()
             .into_iter()
-            .map(|source_bucket| source_bucket.delete_object(&aws_input));
+            .map(|source_bucket| source_bucket.delete_object_and_update_size(&aws_input));
 
         // run all delete operations in parallel
         // if any of them succeeds, we return success
+        let mut ret: Option<DeleteObjectOutput> = None;
         for res in futures::future::join_all(futures).await {
             if let Ok(output) = res {
-                return Ok(try_from_aws(output).expect("Failed to parse output"));
+                if ret.is_none() {
+                    ret = Some(try_from_aws(output).expect("Failed to parse output"));
+                }
             }
         }
-        Err(S3Error::new(s3s::S3ErrorCode::NoSuchKey))
+        match ret {
+            Some(output) => Ok(output),
+            None => Err(S3Error::new(s3s::S3ErrorCode::NoSuchKey)),
+        }
     }
 
     async fn list_objects(&self, input: ListObjectsInput) -> S3Result<ListObjectsOutput> {
