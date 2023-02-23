@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, fs::File};
 
 use aws_sdk_s3::{
-    error::{DeleteObjectError, GetObjectError},
-    input::{DeleteObjectInput, GetObjectInput},
+    error::{DeleteObjectError, GetObjectError, ListObjectsError},
+    input::{DeleteObjectInput, GetObjectInput, ListObjectsInput},
     output::GetObjectOutput,
     presigning::config::PresigningConfig,
     types::{ByteStream, SdkError},
@@ -224,6 +224,26 @@ impl SourceBucket {
         self.bucket
             .client
             .delete_object()
+            .customize()
+            .await
+            .unwrap()
+            .map_operation(|_| operation)
+            .unwrap()
+            .send()
+            .await
+    }
+
+    pub async fn list_objects(
+        &self,
+        input: &ListObjectsInput,
+    ) -> Result<aws_sdk_s3::output::ListObjectsOutput, SdkError<ListObjectsError>> {
+        let mut input = input.clone();
+        input.bucket = Some(self.bucket.bucket_name.clone());
+        let operation = input.make_operation(self.bucket.client.conf()).await;
+
+        self.bucket
+            .client
+            .list_objects()
             .customize()
             .await
             .unwrap()
