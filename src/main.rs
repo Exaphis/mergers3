@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr, time::SystemTime};
 
 use bucket_config::MergedBucket;
 use hyper::Server;
+use log::debug;
 use s3s::{
     dto::{
         Bucket, CommonPrefixList, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
@@ -33,7 +34,8 @@ impl MergerS3 {
 
 #[async_trait::async_trait]
 impl S3 for MergerS3 {
-    async fn list_buckets(&self, _input: ListBucketsInput) -> S3Result<ListBucketsOutput> {
+    async fn list_buckets(&self, input: ListBucketsInput) -> S3Result<ListBucketsOutput> {
+        debug!("list_buckets({:#?})", input);
         let buckets: Vec<Bucket> = self
             .buckets
             .keys()
@@ -58,6 +60,7 @@ impl S3 for MergerS3 {
     }
 
     async fn head_object(&self, input: HeadObjectInput) -> S3Result<HeadObjectOutput> {
+        debug!("head_object({:#?})", input);
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
             return Err(s3_error!(NoSuchBucket));
@@ -78,6 +81,7 @@ impl S3 for MergerS3 {
     }
 
     async fn get_object(&self, input: GetObjectInput) -> S3Result<GetObjectOutput> {
+        debug!("get_object({:#?})", input);
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
             return Err(s3_error!(NoSuchBucket));
@@ -98,6 +102,7 @@ impl S3 for MergerS3 {
     }
 
     async fn delete_object(&self, input: DeleteObjectInput) -> S3Result<DeleteObjectOutput> {
+        debug!("delete_object({:#?})", input);
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
             return Err(s3_error!(NoSuchBucket));
@@ -128,6 +133,7 @@ impl S3 for MergerS3 {
     }
 
     async fn list_objects(&self, input: ListObjectsInput) -> S3Result<ListObjectsOutput> {
+        debug!("list_objects({:#?})", input);
         // list objects from all buckets starting at marker, merge the results until we exhaust
         // the list or get to the limit
         let bucket = self.buckets.get(&input.bucket);
@@ -208,6 +214,7 @@ impl S3 for MergerS3 {
     }
 
     async fn put_object(&self, input: PutObjectInput) -> S3Result<PutObjectOutput> {
+        debug!("put_object({:#?})", input);
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
             return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
@@ -232,8 +239,8 @@ impl S3 for MergerS3 {
         }
         let source_bucket = source_bucket.unwrap();
 
-        println!("PUT object bytes {}", body_len);
-        println!("Chose source bucket {}", source_bucket.get_name());
+        debug!("PUT object bytes {}", body_len);
+        debug!("Chose source bucket {}", source_bucket.get_name());
         match source_bucket
             .put_object_and_update_size(aws_input, body_len)
             .await
@@ -244,6 +251,7 @@ impl S3 for MergerS3 {
     }
 
     async fn copy_object(&self, input: CopyObjectInput) -> S3Result<CopyObjectOutput> {
+        debug!("copy_object({:#?})", input);
         // HEAD object to see which bucket it's in
         // if we have enough space in the source bucket, copy it
         // otherwise, copy it to another available bucket
@@ -278,6 +286,7 @@ impl S3 for MergerS3 {
 
         let object_size: u64 = head_output.content_length().try_into().unwrap();
         if source_bucket.has_bytes(object_size).await {
+            debug!("Source bucket has enough space, copying object using CopyObject");
             let mut aws_input =
                 try_into_aws(input).expect("Failed to convert CopyObjectInput to AWS");
             aws_input.copy_source = Some(
@@ -297,6 +306,7 @@ impl S3 for MergerS3 {
                 Err(s3_error!(InternalError))
             }
         } else {
+            debug!("Source bucket doesn't have enough space, copying object using GetObject + PutObject");
             let get_object_input = aws_sdk_s3::input::GetObjectInput::builder()
                 .key(copy_source_key)
                 .build()

@@ -165,6 +165,9 @@ impl DeserializableBucket {
                 .expect("Failed to list objects in bucket");
 
             for object in list_objects_output.contents.as_ref().unwrap_or(&vec![]) {
+                if object.key() == Some(".mergers3") {
+                    continue;
+                }
                 used_bytes += object.size as u64;
             }
 
@@ -181,6 +184,7 @@ impl DeserializableBucket {
     async fn put_capacity_file(&self, used_bytes: u64) {
         // write the used capacity to the .mergers3 file
         // this might change the capacity of the bucket, but it should only be a few bytes
+        // so ignore the .mergers3 file when calculating the capacity
         self.client
             .put_object()
             .bucket(&self.bucket_name)
@@ -190,7 +194,7 @@ impl DeserializableBucket {
             .await
             .expect(
                 format!(
-                    "Failed to create .mergers3 file in bucket {}",
+                    "Failed to put .mergers3 file in bucket {}",
                     self.bucket_name
                 )
                 .as_str(),
@@ -208,7 +212,7 @@ impl DeserializableBucket {
         if cached_used_bytes.is_some() {
             let used_bytes = self.calc_used_bytes().await;
             if used_bytes != cached_used_bytes.unwrap() {
-                warn!("Bucket {} has a .mergers3 file with a different capacity ({}) than the actual capacity ({})", self.bucket_name, cached_used_bytes.unwrap(), used_bytes);
+                warn!("Bucket {} has a .mergers3 file with a different size ({}) than the actual size ({})", self.bucket_name, cached_used_bytes.unwrap(), used_bytes);
             }
         } else {
             warn!("Bucket {} does not have a .mergers3 file", self.bucket_name);
