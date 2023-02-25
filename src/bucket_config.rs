@@ -19,7 +19,7 @@ use serde::{
     de::{MapAccess, Visitor},
     Deserialize, Deserializer,
 };
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::Mutex};
 
 use crate::utils::select_some;
 
@@ -235,6 +235,11 @@ pub struct SourceBucket {
     bucket: DeserializableBucket,
     #[serde(rename = "capacity_gb", deserialize_with = "bytes_from_gb_f64")]
     capacity_bytes: u64,
+
+    #[serde(skip)]
+    // only one thread can be making size-modifying requests at a time
+    // otherwise, the capacity cache file value will be subject to race conditions
+    size_mutex: Mutex<()>,
 }
 
 pub enum SourceBucketDeleteObjectError {
@@ -340,6 +345,8 @@ impl SourceBucket {
         &self,
         input: &DeleteObjectInput,
     ) -> Result<aws_sdk_s3::output::DeleteObjectOutput, SourceBucketDeleteObjectError> {
+        let _guard = self.size_mutex.lock().await;
+
         let obj_size = self
             .bucket
             .client
@@ -396,6 +403,8 @@ impl SourceBucket {
         mut input: PutObjectInput, // not a reference because PutObjectInput doesn't implement Clone for some reason
         body_bytes: u64,
     ) -> Result<aws_sdk_s3::output::PutObjectOutput, SdkError<PutObjectError>> {
+        let _guard = self.size_mutex.lock().await;
+
         input.bucket = Some(self.bucket.bucket_name.clone());
         let operation = input.make_operation(self.bucket.client.conf()).await;
 
@@ -422,6 +431,8 @@ impl SourceBucket {
         input: &CopyObjectInput,
         body_bytes: u64,
     ) -> Result<aws_sdk_s3::output::CopyObjectOutput, SdkError<CopyObjectError>> {
+        let _guard = self.size_mutex.lock().await;
+
         let mut input = input.clone();
         input.bucket = Some(self.bucket.bucket_name.clone());
         let operation = input.make_operation(self.bucket.client.conf()).await;
