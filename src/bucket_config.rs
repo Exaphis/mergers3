@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, fs::File};
 
 use aws_sdk_s3::{
-    error::{DeleteObjectError, GetObjectError, HeadObjectError, ListObjectsError},
-    input::{DeleteObjectInput, GetObjectInput, HeadObjectInput, ListObjectsInput},
+    error::{DeleteObjectError, GetObjectError, HeadObjectError, ListObjectsError, PutObjectError},
+    input::{DeleteObjectInput, GetObjectInput, HeadObjectInput, ListObjectsInput, PutObjectInput},
     types::{ByteStream, SdkError},
     Client, Credentials, Region,
 };
@@ -12,6 +12,8 @@ use serde::{
     Deserialize, Deserializer,
 };
 use tokio::io::AsyncReadExt;
+
+use crate::utils::select_some;
 
 pub struct DeserializableBucket {
     client: Client,
@@ -117,7 +119,7 @@ impl std::fmt::Debug for DeserializableBucket {
 }
 
 impl DeserializableBucket {
-    async fn get_cached_used_bytes(&self) -> Option<i64> {
+    async fn get_cached_used_bytes(&self) -> Option<u64> {
         match self
             .client
             .get_object()
@@ -134,14 +136,14 @@ impl DeserializableBucket {
                     .read_to_end(&mut bytes)
                     .await
                     .unwrap();
-                let used_bytes = String::from_utf8(bytes).unwrap().parse::<i64>().unwrap();
+                let used_bytes = String::from_utf8(bytes).unwrap().parse::<u64>().unwrap();
                 Some(used_bytes)
             }
             Err(_) => None,
         }
     }
 
-    async fn calc_used_bytes(&self) -> i64 {
+    async fn calc_used_bytes(&self) -> u64 {
         let mut used_bytes = 0;
         let mut continuation_token: Option<String> = None;
         loop {
@@ -155,7 +157,7 @@ impl DeserializableBucket {
                 .expect("Failed to list objects in bucket");
 
             for object in list_objects_output.contents.as_ref().unwrap_or(&vec![]) {
-                used_bytes += object.size;
+                used_bytes += object.size as u64;
             }
 
             let next_continuation_token = list_objects_output.next_continuation_token();
@@ -168,7 +170,7 @@ impl DeserializableBucket {
         used_bytes
     }
 
-    async fn put_capacity_file(&self, used_bytes: i64) {
+    async fn put_capacity_file(&self, used_bytes: u64) {
         // write the used capacity to the .mergers3 file
         // this might change the capacity of the bucket, but it should only be a few bytes
         self.client
@@ -241,6 +243,23 @@ impl From<SdkError<HeadObjectError>> for SourceBucketDeleteObjectError {
 }
 
 impl SourceBucket {
+    pub fn get_name(&self) -> &str {
+        &self.bucket.bucket_name
+    }
+
+    async fn has_bytes(&self, min_available_bytes: u64) -> Option<&Self> {
+        let used_bytes = match self.bucket.get_cached_used_bytes().await {
+            Some(used_bytes) => used_bytes,
+            None => self.bucket.calc_used_bytes().await,
+        };
+
+        if self.capacity_bytes - used_bytes >= min_available_bytes {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     pub async fn update_used_bytes(&self, delta_bytes: i64) {
         let used_bytes = match self.bucket.get_cached_used_bytes().await {
             Some(used_bytes) => used_bytes,
@@ -248,7 +267,7 @@ impl SourceBucket {
         };
 
         self.bucket
-            .put_capacity_file(used_bytes + delta_bytes)
+            .put_capacity_file(used_bytes.checked_add_signed(delta_bytes).unwrap())
             .await;
     }
 
@@ -348,13 +367,39 @@ impl SourceBucket {
             .send()
             .await
     }
+
+    pub async fn put_object_and_update_size(
+        &self,
+        mut input: PutObjectInput, // not a reference because PutObjectInput doesn't implement Clone for some reason
+        body_bytes: u64,
+    ) -> Result<aws_sdk_s3::output::PutObjectOutput, SdkError<PutObjectError>> {
+        input.bucket = Some(self.bucket.bucket_name.clone());
+        let operation = input.make_operation(self.bucket.client.conf()).await;
+
+        let resp = self
+            .bucket
+            .client
+            .put_object()
+            .key(" ")
+            .customize()
+            .await
+            .unwrap()
+            .map_operation(|_| operation)
+            .unwrap()
+            .send()
+            .await?;
+
+        self.update_used_bytes(i64::try_from(body_bytes).unwrap())
+            .await;
+        Ok(resp)
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MergedBucket(Vec<SourceBucket>);
 
 impl MergedBucket {
-    pub async fn create_capacity_files(&self) {
+    async fn create_capacity_files(&self) {
         let futures = self
             .0
             .iter()
@@ -368,6 +413,14 @@ impl MergedBucket {
             .iter()
             .map(|source_bucket| source_bucket.bucket.check_capacity_file());
         futures::future::join_all(futures).await;
+    }
+
+    pub async fn get_source_bucket(&self, min_available_bytes: u64) -> Option<&SourceBucket> {
+        let futures = self
+            .0
+            .iter()
+            .map(|source_bucket| source_bucket.has_bytes(min_available_bytes));
+        select_some(futures).await
     }
 
     pub fn as_content(&self) -> &Vec<SourceBucket> {

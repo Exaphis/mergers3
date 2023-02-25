@@ -2,14 +2,15 @@ use std::{collections::BTreeMap, net::SocketAddr, time::SystemTime};
 
 use bucket_config::MergedBucket;
 use hyper::Server;
-use log::debug;
 use s3s::{
     dto::{
         Bucket, CommonPrefixList, DeleteObjectInput, DeleteObjectOutput, GetObjectInput,
         GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-        ListObjectsInput, ListObjectsOutput, NextMarker, ObjectList, Timestamp,
+        ListObjectsInput, ListObjectsOutput, NextMarker, ObjectList, PutObjectInput,
+        PutObjectOutput, Timestamp,
     },
     service::S3Service,
+    stream::ByteStream,
     S3Error, S3Result, S3,
 };
 use s3s_aws::conv::{try_from_aws, try_into_aws};
@@ -155,7 +156,6 @@ impl S3 for MergerS3 {
 
         for res in futures::future::join_all(futures).await {
             if let Ok(output) = res {
-                debug!("Got output: {:?}", output);
                 if let Some(src_prefixes) = output.common_prefixes() {
                     common_prefixes.extend(
                         src_prefixes
@@ -204,6 +204,42 @@ impl S3 for MergerS3 {
             name: Some(name),
             ..Default::default()
         })
+    }
+
+    async fn put_object(&self, input: PutObjectInput) -> S3Result<PutObjectOutput> {
+        let bucket = self.buckets.get(&input.bucket);
+        if bucket.is_none() {
+            return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
+        }
+        let bucket = bucket.unwrap();
+
+        let body_len: u64 = (&input.body)
+            .as_ref()
+            .map(|b| {
+                b.remaining_length()
+                    .exact()
+                    .expect("Failed to get remaining length")
+            })
+            .unwrap_or(0)
+            .try_into()
+            .unwrap();
+        let aws_input = try_into_aws(input).expect("Failed to convert GetObjectInput to AWS");
+
+        let source_bucket = bucket.get_source_bucket(body_len).await;
+        if source_bucket.is_none() {
+            return Err(S3Error::new(s3s::S3ErrorCode::InvalidBucketState));
+        }
+        let source_bucket = source_bucket.unwrap();
+
+        println!("PUT object bytes {}", body_len);
+        println!("Chose source bucket {}", source_bucket.get_name());
+        match source_bucket
+            .put_object_and_update_size(aws_input, body_len)
+            .await
+        {
+            Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
+            Err(_) => Err(S3Error::new(s3s::S3ErrorCode::InternalError)),
+        }
     }
 }
 

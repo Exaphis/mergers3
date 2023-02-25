@@ -19,3 +19,17 @@ where
     }
     Err(last_error.expect("Empty iterator."))
 }
+
+pub async fn select_some<F, A>(futs: impl IntoIterator<Item = F>) -> Option<A>
+where
+    F: Future<Output = Option<A>>,
+{
+    let mut futs: FuturesUnordered<F> = futs.into_iter().collect();
+
+    while let Some(next) = futs.next().await {
+        if next.is_some() {
+            return next;
+        }
+    }
+    None
+}
