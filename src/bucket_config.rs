@@ -1,11 +1,19 @@
 use std::{collections::BTreeMap, fs::File};
 
 use aws_sdk_s3::{
-    error::{DeleteObjectError, GetObjectError, HeadObjectError, ListObjectsError, PutObjectError},
-    input::{DeleteObjectInput, GetObjectInput, HeadObjectInput, ListObjectsInput, PutObjectInput},
+    error::{
+        CopyObjectError, DeleteObjectError, GetObjectError, HeadObjectError, ListObjectsError,
+        PutObjectError,
+    },
+    input::{
+        CopyObjectInput, DeleteObjectInput, GetObjectInput, HeadObjectInput, ListObjectsInput,
+        PutObjectInput,
+    },
+    output::HeadObjectOutput,
     types::{ByteStream, SdkError},
     Client, Credentials, Region,
 };
+use futures::FutureExt;
 use log::{debug, warn};
 use serde::{
     de::{MapAccess, Visitor},
@@ -247,16 +255,27 @@ impl SourceBucket {
         &self.bucket.bucket_name
     }
 
-    async fn has_bytes(&self, min_available_bytes: u64) -> Option<&Self> {
+    pub async fn has_bytes(&self, min_available_bytes: u64) -> bool {
         let used_bytes = match self.bucket.get_cached_used_bytes().await {
             Some(used_bytes) => used_bytes,
             None => self.bucket.calc_used_bytes().await,
         };
 
-        if self.capacity_bytes - used_bytes >= min_available_bytes {
-            Some(self)
-        } else {
-            None
+        self.capacity_bytes - used_bytes >= min_available_bytes
+    }
+
+    async fn contains_object(&self, key: &str) -> Option<HeadObjectOutput> {
+        match self
+            .bucket
+            .client
+            .head_object()
+            .bucket(&self.bucket.bucket_name)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(res) => Some(res),
+            Err(_) => None,
         }
     }
 
@@ -393,6 +412,34 @@ impl SourceBucket {
             .await;
         Ok(resp)
     }
+
+    pub async fn copy_object_and_update_size(
+        &self,
+        input: &CopyObjectInput,
+        body_bytes: u64,
+    ) -> Result<aws_sdk_s3::output::CopyObjectOutput, SdkError<CopyObjectError>> {
+        let mut input = input.clone();
+        input.bucket = Some(self.bucket.bucket_name.clone());
+        let operation = input.make_operation(self.bucket.client.conf()).await;
+
+        let resp = self
+            .bucket
+            .client
+            .copy_object()
+            .copy_source(" ")
+            .key(" ")
+            .customize()
+            .await
+            .unwrap()
+            .map_operation(|_| operation)
+            .unwrap()
+            .send()
+            .await?;
+
+        self.update_used_bytes(i64::try_from(body_bytes).unwrap())
+            .await;
+        Ok(resp)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,10 +463,31 @@ impl MergedBucket {
     }
 
     pub async fn get_source_bucket(&self, min_available_bytes: u64) -> Option<&SourceBucket> {
-        let futures = self
-            .0
-            .iter()
-            .map(|source_bucket| source_bucket.has_bytes(min_available_bytes));
+        let futures = self.0.iter().map(|source_bucket| {
+            source_bucket
+                .has_bytes(min_available_bytes)
+                .map(
+                    move |success| {
+                        if success {
+                            Some(source_bucket)
+                        } else {
+                            None
+                        }
+                    },
+                )
+        });
+        select_some(futures).await
+    }
+
+    pub async fn find_object_source(&self, key: &str) -> Option<(&SourceBucket, HeadObjectOutput)> {
+        let futures = self.0.iter().map(|source_bucket| {
+            source_bucket
+                .contains_object(key)
+                .map(move |output| match output {
+                    Some(output) => Some((source_bucket, output)),
+                    None => None,
+                })
+        });
         select_some(futures).await
     }
 

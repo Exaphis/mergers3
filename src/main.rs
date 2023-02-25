@@ -4,10 +4,10 @@ use bucket_config::MergedBucket;
 use hyper::Server;
 use s3s::{
     dto::{
-        Bucket, CommonPrefixList, DeleteObjectInput, DeleteObjectOutput, GetObjectInput,
-        GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-        ListObjectsInput, ListObjectsOutput, NextMarker, ObjectList, PutObjectInput,
-        PutObjectOutput, Timestamp,
+        Bucket, CommonPrefixList, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
+        DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput,
+        HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
+        NextMarker, ObjectList, PutObjectInput, PutObjectOutput, Timestamp,
     },
     s3_error,
     service::S3Service,
@@ -240,6 +240,108 @@ impl S3 for MergerS3 {
         {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
             Err(_) => Err(s3_error!(InternalError)),
+        }
+    }
+
+    async fn copy_object(&self, input: CopyObjectInput) -> S3Result<CopyObjectOutput> {
+        // HEAD object to see which bucket it's in
+        // if we have enough space in the source bucket, copy it
+        // otherwise, copy it to another available bucket
+
+        // we only support copying within the same bucket
+        let (copy_source_bucket, copy_source_key) = match input.copy_source {
+            CopySource::Bucket {
+                ref bucket,
+                ref key,
+                version_id: _,
+            } => (bucket.to_string(), key.to_string()),
+            _ => return Err(s3_error!(InvalidRequest)),
+        };
+
+        // TODO: support copying from other buckets
+        // TODO: copy object metadata if requested
+        if input.bucket != copy_source_bucket {
+            return Err(s3_error!(InvalidRequest));
+        }
+
+        let bucket = self.buckets.get(&input.bucket);
+        if bucket.is_none() {
+            return Err(s3_error!(NoSuchBucket));
+        }
+        let bucket = bucket.unwrap();
+
+        let source = bucket.find_object_source(&copy_source_key).await;
+        if source.is_none() {
+            return Err(s3_error!(NoSuchKey));
+        }
+        let (source_bucket, head_output) = source.unwrap();
+
+        let object_size: u64 = head_output.content_length().try_into().unwrap();
+        if source_bucket.has_bytes(object_size).await {
+            let mut aws_input =
+                try_into_aws(input).expect("Failed to convert CopyObjectInput to AWS");
+            aws_input.copy_source = Some(
+                CopySource::Bucket {
+                    bucket: source_bucket.get_name().into(),
+                    key: copy_source_key.into_boxed_str(),
+                    version_id: None,
+                }
+                .format_to_string(),
+            );
+            if let Ok(output) = source_bucket
+                .copy_object_and_update_size(&aws_input, object_size)
+                .await
+            {
+                Ok(try_from_aws(output).expect("Failed to parse output"))
+            } else {
+                Err(s3_error!(InternalError))
+            }
+        } else {
+            let get_object_input = aws_sdk_s3::input::GetObjectInput::builder()
+                .key(copy_source_key)
+                .build()
+                .expect("Failed to build GetObjectInput");
+
+            let get_output = source_bucket
+                .get_object(&get_object_input)
+                .await
+                .expect("Failed to get object");
+            let last_modified: Option<Timestamp> =
+                try_from_aws(get_output.last_modified().copied()).unwrap();
+
+            let mut put_object_input = aws_sdk_s3::input::PutObjectInput::builder().key(input.key);
+            put_object_input = put_object_input
+                .set_cache_control(get_output.cache_control().map(|s| s.to_string()));
+            put_object_input = put_object_input
+                .set_content_disposition(get_output.content_disposition().map(|s| s.to_string()));
+            put_object_input = put_object_input
+                .set_content_encoding(get_output.content_encoding().map(|s| s.to_string()));
+            put_object_input = put_object_input
+                .set_content_language(get_output.content_language().map(|s| s.to_string()));
+            put_object_input =
+                put_object_input.set_content_type(get_output.content_type().map(|s| s.to_string()));
+            put_object_input = put_object_input.set_expires(get_output.expires().copied());
+            put_object_input = put_object_input.set_body(Some(get_output.body));
+            let put_object_input = put_object_input
+                .build()
+                .expect("Failed to build PutObjectInput");
+
+            match source_bucket
+                .put_object_and_update_size(put_object_input, object_size)
+                .await
+            {
+                Ok(output) => {
+                    return Ok(CopyObjectOutput {
+                        copy_object_result: Some(CopyObjectResult {
+                            e_tag: output.e_tag().map(|s| s.to_string()),
+                            last_modified,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                }
+                Err(_) => Err(s3_error!(InternalError)),
+            }
         }
     }
 }
