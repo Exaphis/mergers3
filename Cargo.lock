@@ -1177,6 +1177,7 @@ dependencies = [
  "serde_yaml",
  "time 0.3.19",
  "tokio",
+ "url",
 ]
 
 [[package]]

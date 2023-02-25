@@ -1,14 +1,19 @@
-use std::{collections::BTreeMap, net::SocketAddr, time::SystemTime};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    net::SocketAddr,
+    time::SystemTime,
+};
 
 use bucket_config::MergedBucket;
 use hyper::Server;
 use log::debug;
 use s3s::{
     dto::{
-        Bucket, CommonPrefixList, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
-        DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput,
-        HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
-        NextMarker, ObjectList, PutObjectInput, PutObjectOutput, Timestamp,
+        Bucket, CommonPrefix, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
+        DeleteObjectInput, DeleteObjectOutput, EncodingType, GetObjectInput, GetObjectOutput,
+        HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput,
+        ListObjectsOutput, NextMarker, PutObjectInput, PutObjectOutput, Timestamp,
     },
     s3_error,
     service::S3Service,
@@ -19,6 +24,8 @@ use s3s_aws::conv::{try_from_aws, try_into_aws};
 
 mod bucket_config;
 mod utils;
+
+use crate::utils::ComparableObject;
 
 struct MergerS3 {
     buckets: BTreeMap<String, MergedBucket>,
@@ -136,6 +143,13 @@ impl S3 for MergerS3 {
         debug!("list_objects({:#?})", input);
         // list objects from all buckets starting at marker, merge the results until we exhaust
         // the list or get to the limit
+        // list with no delimiter in order to get the next marker easily
+        // if we hit a next marker, we must end the list and return it as the next marker
+        if input.delimiter.is_some() && input.delimiter.as_ref().unwrap().chars().count() > 1 {
+            return Err(s3_error!(InvalidArgument));
+        }
+        let delimiter = input.delimiter.as_ref().map(|d| d.chars().next().unwrap());
+
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
             return Err(s3_error!(NoSuchBucket));
@@ -144,77 +158,116 @@ impl S3 for MergerS3 {
 
         let name = input.bucket.clone();
         let prefix = input.prefix.clone();
-        let delimiter = input.delimiter.clone();
+        let input_delimiter = input.delimiter.clone();
         let marker = input.marker.clone();
-        let max_keys = input.max_keys;
+        let max_keys = if input.max_keys <= 0 {
+            1000
+        } else {
+            input.max_keys.min(1000)
+        };
+        let encoding_type = input.encoding_type.clone();
 
-        let aws_input = try_into_aws(input).expect("Failed to convert ListObjectsInput to AWS");
+        let mut aws_input = try_into_aws(input).expect("Failed to convert ListObjectsInput to AWS");
+        aws_input.delimiter = None;
+        aws_input.encoding_type = None;
         let futures = bucket
             .as_content()
             .into_iter()
             .map(|source_bucket| source_bucket.list_objects(&aws_input));
 
-        // TODO: temporary hack: just join all commonprefixes and objects,
-        // return the lexically smallest next marker
-        let mut common_prefixes: CommonPrefixList = Vec::new();
-        let mut objects: ObjectList = Vec::new();
-        let mut is_truncated = false;
-        let mut next_marker: Option<NextMarker> = None;
-
+        let mut object_heap: BinaryHeap<Reverse<ComparableObject>> = BinaryHeap::new();
         for res in futures::future::join_all(futures).await {
             if let Ok(output) = res {
-                if let Some(src_prefixes) = output.common_prefixes() {
-                    common_prefixes.extend(
-                        src_prefixes
-                            .iter()
-                            .map(|p| try_from_aws(p.clone()).unwrap()),
-                    );
-                }
-                if let Some(src_objects) = output.contents() {
-                    objects.extend(src_objects.iter().map(|o| try_from_aws(o.clone()).unwrap()));
-                }
-
-                is_truncated |= output.is_truncated();
-                if let Some(src_next_marker) = output.next_marker() {
-                    let src_next_marker = src_next_marker.to_string();
-                    if let Some(next_marker) = &mut next_marker {
-                        if src_next_marker < *next_marker {
-                            *next_marker = src_next_marker;
-                        }
-                    } else {
-                        next_marker = Some(src_next_marker);
-                    }
-                }
+                object_heap.extend(
+                    output
+                        .contents
+                        .into_iter()
+                        .map(|objs| {
+                            objs.into_iter().map(|obj| {
+                                Reverse(ComparableObject(
+                                    try_from_aws(obj).expect("Failed to parse Object"),
+                                ))
+                            })
+                        })
+                        .flatten(),
+                );
             }
         }
 
-        common_prefixes.sort_by(|a, b| a.prefix.cmp(&b.prefix));
-        objects.sort_by(|a, b| a.key.cmp(&b.key));
+        // use btreeset as there can be duplicate objects in different buckets
+        let mut common_prefixes: BTreeSet<String> = BTreeSet::new();
+        let mut objects: BTreeSet<ComparableObject> = BTreeSet::new();
+        let mut is_truncated = false;
+        let mut next_marker: Option<NextMarker> = None;
+
+        let prefix_len = prefix
+            .as_ref()
+            .map(|prefix| prefix.chars().count())
+            .unwrap_or(0);
+
+        while let Some(Reverse(ComparableObject(obj))) = object_heap.pop() {
+            let key = obj.key.as_ref().unwrap();
+            if objects.len() > max_keys as usize {
+                is_truncated = true;
+                next_marker = Some(key.clone());
+                break;
+            }
+
+            if let Some(delim_pos) = key
+                .chars()
+                .skip(prefix_len)
+                .position(|c| Some(c) == delimiter)
+            {
+                common_prefixes.insert(key.chars().take(prefix_len + delim_pos + 1).collect());
+            } else {
+                objects.insert(ComparableObject(obj));
+            }
+        }
 
         Ok(ListObjectsOutput {
             common_prefixes: if common_prefixes.len() > 0 {
-                Some(common_prefixes)
+                Some(
+                    common_prefixes
+                        .into_iter()
+                        .map(|p| CommonPrefix { prefix: Some(p) })
+                        .collect(),
+                )
             } else {
                 None
             },
             contents: if objects.len() > 0 {
-                Some(objects)
+                Some(
+                    objects
+                        .into_iter()
+                        .map(|o| {
+                            let mut o = o.0;
+                            if encoding_type == Some(EncodingType::from_static(EncodingType::URL)) {
+                                o.key = o.key.map(|k| {
+                                    url::form_urlencoded::byte_serialize(k.as_bytes()).collect()
+                                });
+                            }
+                            o
+                        })
+                        .collect(),
+                )
             } else {
                 None
             },
             is_truncated,
             next_marker,
-            delimiter,
+            delimiter: input_delimiter,
             marker,
             max_keys,
             prefix,
             name: Some(name),
+            encoding_type,
             ..Default::default()
         })
     }
 
     async fn put_object(&self, input: PutObjectInput) -> S3Result<PutObjectOutput> {
         debug!("put_object({:#?})", input);
+        debug!("object key: {}", input.key);
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
             return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));

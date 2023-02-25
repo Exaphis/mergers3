@@ -1,4 +1,5 @@
 use futures::{stream::FuturesUnordered, Future, StreamExt};
+use s3s::dto::Object;
 
 // https://users.rust-lang.org/t/usage-of-futures-select-ok/46068/11
 // allows the futures to not need to be boxed
@@ -32,4 +33,26 @@ where
         }
     }
     None
+}
+
+pub struct ComparableObject(pub Object);
+
+impl PartialEq for ComparableObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.key == other.0.key
+    }
+}
+
+impl PartialOrd for ComparableObject {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.0.key.cmp(&other.0.key))
+    }
+}
+
+impl Eq for ComparableObject {}
+
+impl Ord for ComparableObject {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.key.cmp(&other.0.key)
+    }
 }
