@@ -9,9 +9,10 @@ use s3s::{
         ListObjectsInput, ListObjectsOutput, NextMarker, ObjectList, PutObjectInput,
         PutObjectOutput, Timestamp,
     },
+    s3_error,
     service::S3Service,
     stream::ByteStream,
-    S3Error, S3Result, S3,
+    S3Auth, S3Error, S3Result, S3,
 };
 use s3s_aws::conv::{try_from_aws, try_into_aws};
 
@@ -59,7 +60,7 @@ impl S3 for MergerS3 {
     async fn head_object(&self, input: HeadObjectInput) -> S3Result<HeadObjectOutput> {
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
-            return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
+            return Err(s3_error!(NoSuchBucket));
         }
         let bucket = bucket.unwrap();
 
@@ -72,14 +73,14 @@ impl S3 for MergerS3 {
 
         match utils::select_ok(futures).await {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
-            Err(_) => Err(S3Error::new(s3s::S3ErrorCode::NoSuchKey)),
+            Err(_) => Err(s3_error!(NoSuchKey)),
         }
     }
 
     async fn get_object(&self, input: GetObjectInput) -> S3Result<GetObjectOutput> {
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
-            return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
+            return Err(s3_error!(NoSuchBucket));
         }
         let bucket = bucket.unwrap();
 
@@ -92,14 +93,14 @@ impl S3 for MergerS3 {
 
         match utils::select_ok(futures).await {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
-            Err(_) => Err(S3Error::new(s3s::S3ErrorCode::NoSuchKey)),
+            Err(_) => Err(s3_error!(NoSuchKey)),
         }
     }
 
     async fn delete_object(&self, input: DeleteObjectInput) -> S3Result<DeleteObjectOutput> {
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
-            return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
+            return Err(s3_error!(NoSuchBucket));
         }
         let bucket = bucket.unwrap();
 
@@ -122,7 +123,7 @@ impl S3 for MergerS3 {
         }
         match ret {
             Some(output) => Ok(output),
-            None => Err(S3Error::new(s3s::S3ErrorCode::NoSuchKey)),
+            None => Err(s3_error!(NoSuchKey)),
         }
     }
 
@@ -131,7 +132,7 @@ impl S3 for MergerS3 {
         // the list or get to the limit
         let bucket = self.buckets.get(&input.bucket);
         if bucket.is_none() {
-            return Err(S3Error::new(s3s::S3ErrorCode::NoSuchBucket));
+            return Err(s3_error!(NoSuchBucket));
         }
         let bucket = bucket.unwrap();
 
@@ -227,7 +228,7 @@ impl S3 for MergerS3 {
 
         let source_bucket = bucket.get_source_bucket(body_len).await;
         if source_bucket.is_none() {
-            return Err(S3Error::new(s3s::S3ErrorCode::InvalidBucketState));
+            return Err(s3_error!(InvalidBucketState));
         }
         let source_bucket = source_bucket.unwrap();
 
@@ -238,8 +239,18 @@ impl S3 for MergerS3 {
             .await
         {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
-            Err(_) => Err(S3Error::new(s3s::S3ErrorCode::InternalError)),
+            Err(_) => Err(s3_error!(InternalError)),
         }
+    }
+}
+
+struct MergerS3Auth {}
+
+// must use authorized connections for CopyObject to work
+#[async_trait::async_trait]
+impl S3Auth for MergerS3Auth {
+    async fn get_secret_key(&self, _access_key: &str) -> S3Result<String> {
+        Ok("secret".to_string())
     }
 }
 
@@ -249,10 +260,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
-    let service = S3Service::new(Box::new(MergerS3::new().await))
-        .into_shared()
-        .into_make_service();
-    let server = Server::bind(&addr).serve(service);
+    let mut service = S3Service::new(Box::new(MergerS3::new().await));
+    service.set_auth(Box::new(MergerS3Auth {}));
+    let make_service = service.into_shared().into_make_service();
+
+    let server = Server::bind(&addr).serve(make_service);
 
     println!("Listening on http://{}", addr);
     server.await?;
