@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::File};
+use std::{collections::BTreeMap, fmt::Debug, fs::File};
 
 use aws_sdk_s3::{
     error::{
@@ -13,7 +13,7 @@ use aws_sdk_s3::{
     types::{ByteStream, SdkError},
     Client, Credentials, Region,
 };
-use futures::FutureExt;
+use futures::{future::BoxFuture, FutureExt};
 use log::{debug, warn};
 use serde::{
     de::{MapAccess, Visitor},
@@ -21,7 +21,7 @@ use serde::{
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
-use crate::utils::select_some;
+use crate::utils::{select_ok, select_some};
 
 pub struct DeserializableBucket {
     client: Client,
@@ -289,6 +289,8 @@ impl SourceBucket {
     }
 
     pub async fn update_used_bytes(&self, delta_bytes: i64) {
+        let _guard = self.size_mutex.lock().await;
+
         let used_bytes = match self.bucket.get_cached_used_bytes().await {
             Some(used_bytes) => used_bytes,
             None => self.bucket.calc_used_bytes().await,
@@ -345,8 +347,6 @@ impl SourceBucket {
         &self,
         input: &DeleteObjectInput,
     ) -> Result<aws_sdk_s3::output::DeleteObjectOutput, SourceBucketDeleteObjectError> {
-        let _guard = self.size_mutex.lock().await;
-
         let obj_size = self
             .bucket
             .client
@@ -403,8 +403,6 @@ impl SourceBucket {
         mut input: PutObjectInput, // not a reference because PutObjectInput doesn't implement Clone for some reason
         body_bytes: u64,
     ) -> Result<aws_sdk_s3::output::PutObjectOutput, SdkError<PutObjectError>> {
-        let _guard = self.size_mutex.lock().await;
-
         input.bucket = Some(self.bucket.bucket_name.clone());
         let operation = input.make_operation(self.bucket.client.conf()).await;
 
@@ -431,8 +429,6 @@ impl SourceBucket {
         input: &CopyObjectInput,
         body_bytes: u64,
     ) -> Result<aws_sdk_s3::output::CopyObjectOutput, SdkError<CopyObjectError>> {
-        let _guard = self.size_mutex.lock().await;
-
         let mut input = input.clone();
         input.bucket = Some(self.bucket.bucket_name.clone());
         let operation = input.make_operation(self.bucket.client.conf()).await;
@@ -459,6 +455,8 @@ impl SourceBucket {
 
 #[derive(Debug, Deserialize)]
 pub struct MergedBucket(Vec<SourceBucket>);
+
+pub type BucketFunc<'a, A, B, E> = fn(&'a SourceBucket, &'a A) -> BoxFuture<'a, Result<B, E>>;
 
 impl MergedBucket {
     async fn create_capacity_files(&self) {
@@ -504,6 +502,34 @@ impl MergedBucket {
                 })
         });
         select_some(futures).await
+    }
+
+    pub async fn first_found<'a, A, B, E>(
+        &'a self,
+        input: &'a A,
+        f: BucketFunc<'a, A, B, E>,
+    ) -> Result<B, Vec<E>> {
+        // return the first result that succeeds
+        let futures = self.0.iter().map(|source_bucket| f(source_bucket, input));
+        select_ok(futures).await
+    }
+
+    pub async fn all<'a, A, B, E>(
+        &'a self,
+        input: &'a A,
+        f: BucketFunc<'a, A, B, E>,
+    ) -> (Vec<B>, Vec<E>) {
+        let futures = self.0.iter().map(|source_bucket| f(source_bucket, input));
+        let mut successes = Vec::new();
+        let mut errs = Vec::new();
+        for res in futures::future::join_all(futures).await {
+            if let Ok(res) = res {
+                successes.push(res);
+            } else if let Err(err) = res {
+                errs.push(err);
+            }
+        }
+        (successes, errs)
     }
 
     pub fn as_content(&self) -> &Vec<SourceBucket> {

@@ -5,9 +5,9 @@ use std::{
     time::SystemTime,
 };
 
-use bucket_config::MergedBucket;
+use bucket_config::{MergedBucket, SourceBucketDeleteObjectError};
 use hyper::Server;
-use log::debug;
+use log::{debug, warn};
 use s3s::{
     dto::{
         Bucket, CommonPrefix, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
@@ -25,7 +25,7 @@ use s3s_aws::conv::{try_from_aws, try_into_aws};
 mod bucket_config;
 mod utils;
 
-use crate::utils::ComparableObject;
+use crate::{bucket_config::SourceBucket, utils::ComparableObject};
 
 struct MergerS3 {
     buckets: BTreeMap<String, MergedBucket>,
@@ -75,13 +75,10 @@ impl S3 for MergerS3 {
         let bucket = bucket.unwrap();
 
         let aws_input = try_into_aws(input).expect("Failed to convert GetObjectInput to AWS");
-
-        let futures = bucket
-            .as_content()
-            .into_iter()
-            .map(|source_bucket| source_bucket.head_object(&aws_input));
-
-        match utils::select_ok(futures).await {
+        match bucket
+            .first_found(&aws_input, |a, b| Box::pin(SourceBucket::head_object(a, b)))
+            .await
+        {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
             Err(_) => Err(s3_error!(NoSuchKey)),
         }
@@ -97,12 +94,10 @@ impl S3 for MergerS3 {
 
         let aws_input = try_into_aws(input).expect("Failed to convert GetObjectInput to AWS");
 
-        let futures = bucket
-            .as_content()
-            .into_iter()
-            .map(|source_bucket| source_bucket.get_object(&aws_input));
-
-        match utils::select_ok(futures).await {
+        match bucket
+            .first_found(&aws_input, |a, b| Box::pin(SourceBucket::get_object(a, b)))
+            .await
+        {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
             Err(_) => Err(s3_error!(NoSuchKey)),
         }
@@ -118,24 +113,21 @@ impl S3 for MergerS3 {
 
         let aws_input = try_into_aws(input).expect("Failed to convert DeleteObjectInput to AWS");
 
-        let futures = bucket
-            .as_content()
-            .into_iter()
-            .map(|source_bucket| source_bucket.delete_object_and_update_size(&aws_input));
+        let (res, errs) = bucket
+            .all(&aws_input, |a, b| {
+                Box::pin(SourceBucket::delete_object_and_update_size(a, b))
+            })
+            .await;
 
-        // run all delete operations in parallel
-        // if any of them succeeds, we return success
-        let mut ret: Option<DeleteObjectOutput> = None;
-        for res in futures::future::join_all(futures).await {
-            if let Ok(output) = res {
-                if ret.is_none() {
-                    ret = Some(try_from_aws(output).expect("Failed to parse output"));
+        if res.is_empty() {
+            for err in errs {
+                if let SourceBucketDeleteObjectError::DeleteObject(err) = err {
+                    warn!("delete_object received a delete object error: {:?}", err);
                 }
             }
-        }
-        match ret {
-            Some(output) => Ok(output),
-            None => Err(s3_error!(NoSuchKey)),
+            Err(s3_error!(NoSuchKey))
+        } else {
+            Ok(try_from_aws(res[0].clone()).expect("Failed to parse output"))
         }
     }
 
@@ -299,7 +291,10 @@ impl S3 for MergerS3 {
             .await
         {
             Ok(output) => Ok(try_from_aws(output).expect("Failed to parse output")),
-            Err(_) => Err(s3_error!(InternalError)),
+            Err(e) => {
+                warn!("Failed to put object: {}", e);
+                Err(s3_error!(InternalError))
+            }
         }
     }
 

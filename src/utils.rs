@@ -3,22 +3,22 @@ use s3s::dto::Object;
 
 // https://users.rust-lang.org/t/usage-of-futures-select-ok/46068/11
 // allows the futures to not need to be boxed
-pub async fn select_ok<F, A, B>(futs: impl IntoIterator<Item = F>) -> Result<A, B>
+pub async fn select_ok<F, A, B>(futs: impl IntoIterator<Item = F>) -> Result<A, Vec<B>>
 where
     F: Future<Output = Result<A, B>>,
 {
     let mut futs: FuturesUnordered<F> = futs.into_iter().collect();
 
-    let mut last_error: Option<B> = None;
+    let mut errors: Vec<B> = Vec::new();
     while let Some(next) = futs.next().await {
         match next {
             Ok(ok) => return Ok(ok),
             Err(err) => {
-                last_error = Some(err);
+                errors.push(err);
             }
         }
     }
-    Err(last_error.expect("Empty iterator."))
+    Err(errors)
 }
 
 pub async fn select_some<F, A>(futs: impl IntoIterator<Item = F>) -> Option<A>
@@ -56,3 +56,5 @@ impl Ord for ComparableObject {
         self.0.key.cmp(&other.0.key)
     }
 }
+
+// https://stackoverflow.com/a/60351296/6686559
