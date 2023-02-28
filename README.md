@@ -1,9 +1,21 @@
 # mergers3
 
-[mergerfs](https://github.com/trapexit/mergerfs), but dumb. Born out of the desire to
-merge multiple S3 buckets into one.
+## What?
 
-## Supported operations
+[mergerfs](https://github.com/trapexit/mergerfs), but for S3. Born out of the desire to
+merge multiple small S3 buckets into one larger bucket.
+Supports limits on the size of the underlying source buckets.
+
+## Why?
+
+I have a bunch of free tier S3 buckets, but none of them are really big enough to store
+anything useful. So I merged them into one big bucket.
+
+You could (and should instead) use [StableBit CloudDrive + DrivePool](https://stablebit.com/DrivePool/Features)
+to merge multiple buckets into a single drive. But why pay $60 when you can... spend a
+week of your precious life to write a janky program...
+
+## How?
 
 Free space is kept in a bucket object called '.mergers3'. This object is created when
 the bucket is first used. It is updated when an object is added or removed.
